@@ -14,7 +14,7 @@ const { id } = await botClient.sendCalls({
       data: encodeFunctionData({
         abi: testContractAbi,
         functionName: "set",
-        args: [BigInt(45)], // replace 42 with whatever value you want to set
+        args: [BigInt(45)], // replace 45 with whatever value you want to set
       }),
     },
   ],
