@@ -1,0 +1,15 @@
+{
+  "name": "eip7702-permissioned",
+  "type": "module",
+  "dependencies": {
+    "@aa-sdk/core": "^4.86.0",
+    "@account-kit/infra": "^4.86.0",
+    "@account-kit/smart-contracts": "^4.86.0",
+    "@alchemy/wallet-apis": "^5.0.0-beta.18",
+    "dotenv": "^17.4.0",
+    "viem": "^2.47.5"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}
