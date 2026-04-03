@@ -135,11 +135,49 @@ def create_session(
     }
 
 
+def send_and_wait(
+    rpc: AlchemyRpcClient,
+    smart_wallet_account: str,
+    delegate_private_key: str,
+    to: str,
+    value: str,
+    data_hex: str,
+    permission_obj: Dict[str, Any],
+    chain_id: str,
+    paymaster_policy_id: Optional[str],
+    prepare_method_name: str = "wallet_prepareCalls",
+    send_prepared_method_name: str = "wallet_sendPreparedCalls",
+    status_method_name: str = "wallet_getCallsStatus",
+) -> Dict[str, Any]:
+    call_id = prepare_and_send_calls(
+        rpc=rpc,
+        smart_wallet_account=smart_wallet_account,
+        delegate_private_key=delegate_private_key,
+        to=to,
+        value=value,
+        data_hex=data_hex,
+        permission_obj=permission_obj,
+        chain_id=chain_id,
+        paymaster_policy_id=paymaster_policy_id or None,
+        prepare_method_name=prepare_method_name,
+        send_prepared_method_name=send_prepared_method_name,
+    )
+    print("call id:", call_id)
+
+    status = wait_for_calls_status(
+        rpc=rpc,
+        call_id=call_id,
+        method_name=status_method_name,
+    )
+    print("final status:", status)
+
+
 def prepare_and_send_calls(
     rpc: AlchemyRpcClient,
     smart_wallet_account: str,
     delegate_private_key: str,
     to: str,
+    value: str,
     data_hex: str,
     permission_obj: Dict[str, Any],
     chain_id: str,
@@ -147,24 +185,24 @@ def prepare_and_send_calls(
     prepare_method_name: str = "wallet_prepareCalls",
     send_prepared_method_name: str = "wallet_sendPreparedCalls",
 ) -> str:
-    rpc_permissions: Dict[str, Any]
-    if permission_obj.get("sessionId") and permission_obj.get("signature"):
-        rpc_permissions = {
+    capabilities: Dict[str, Any] = {}
+    if permission_obj and permission_obj.get("sessionId") and permission_obj.get("signature"):
+        capabilities["permissions"] = {
             "sessionId": permission_obj["sessionId"],
             "signature": permission_obj["signature"],
         }
-    else:
-        # Fallback for older context-only payloads.
-        rpc_permissions = permission_obj
 
     prepare_body: Dict[str, Any] = {
         "chainId": chain_id,
         "from": smart_wallet_account,
-        "calls": [{"to": to, "value": "0x0", "data": data_hex}],
-        "capabilities": {"permissions": rpc_permissions},
+        "calls": [{"to": to, "value": value, "data": data_hex}],
     }
+
     if paymaster_policy_id:
-        prepare_body["capabilities"]["paymasterService"] = {"policyId": paymaster_policy_id}
+        capabilities["paymasterService"] = {"policyId": paymaster_policy_id}
+
+    if capabilities:
+        prepare_body["capabilities"] = capabilities
 
     prepared = rpc.call(prepare_method_name, [prepare_body])
 
@@ -192,7 +230,7 @@ def prepare_and_send_calls(
         "type": prepared.get("type"),
         "data": prepared.get("data"),
         "chainId": prepared.get("chainId", chain_id),
-        "capabilities": {"permissions": rpc_permissions},
+        "capabilities": capabilities,
         "signature": {"type": "secp256k1", "data": userop_signature},
     }
     result = rpc.call(send_prepared_method_name, [send_prepared_body])
@@ -233,13 +271,12 @@ def main() -> None:
         os.getenv("OWNER_PRIVATE_KEY", os.getenv("OWNER_ACCOUNT", ""))
     )
     delegate_private_key = normalize_private_key(os.getenv("DELEGATE_PRIVATE_KEY", ""))
-    smart_wallet_account = os.getenv("SMART_WALLET_ACCOUNT", "")
     delegate_public_key_env = os.getenv("DELEGATE_PUBLIC_KEY", "")
     delegate_public_key = (
         Account.from_key(delegate_private_key).address if delegate_private_key else delegate_public_key_env
     )
     contract_address = os.getenv("TARGET_CONTRACT", "")
-    paymaster_policy_id = os.getenv("ALCHEMY_POLICY_ID", "")
+    paymaster_policy_id = os.getenv("POLICY_ID", "")
 
     # Override if your endpoint uses different method names.
     grant_method = os.getenv("ALCHEMY_GRANT_METHOD", "wallet_createSession")
@@ -255,7 +292,7 @@ def main() -> None:
             ("OWNER_ACCOUNT", owner_account),
             ("OWNER_PRIVATE_KEY", owner_private_key),
             ("DELEGATE_PRIVATE_KEY", delegate_private_key),
-            ("SMART_WALLET_ACCOUNT", smart_wallet_account),
+            ("SMART_WALLET_ACCOUNT", owner_account),
             ("DELEGATE_PUBLIC_KEY", delegate_public_key),
             ("TARGET_CONTRACT", contract_address),
         ]
@@ -274,6 +311,21 @@ def main() -> None:
 
     rpc = AlchemyRpcClient(rpc_url_override or build_rpc_url(api_key))
 
+    send_and_wait(
+        rpc=rpc,
+        smart_wallet_account=owner_account,
+        delegate_private_key=owner_private_key,
+        to="0x0000000000000000000000000000000000000000",
+        value="0x0",
+        data_hex="0x",
+        permission_obj=None,
+        chain_id=chain_id,
+        paymaster_policy_id=paymaster_policy_id or None,
+        prepare_method_name=prepare_method,
+        send_prepared_method_name=send_method,
+        status_method_name=status_method,
+    )
+
     permission = create_session(
         rpc=rpc,
         owner_account=owner_account,
@@ -286,26 +338,20 @@ def main() -> None:
     print("permission:", permission)
 
     data_hex = encode_set_uint256(46)
-    call_id = prepare_and_send_calls(
+    send_and_wait(
         rpc=rpc,
-        smart_wallet_account=smart_wallet_account,
+        smart_wallet_account=owner_account,
         delegate_private_key=delegate_private_key,
         to=contract_address,
+        value="0x0",
         data_hex=data_hex,
         permission_obj=permission,
         chain_id=chain_id,
         paymaster_policy_id=paymaster_policy_id or None,
         prepare_method_name=prepare_method,
         send_prepared_method_name=send_method,
+        status_method_name=status_method,
     )
-    print("call id:", call_id)
-
-    status = wait_for_calls_status(
-        rpc=rpc,
-        call_id=call_id,
-        method_name=status_method,
-    )
-    print("final status:", status)
 
 
 if __name__ == "__main__":

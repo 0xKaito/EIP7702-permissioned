@@ -14,6 +14,21 @@ export const client = createSmartWalletClient({
   // paymaster: { policyId: process.env.POLICY_ID },
 });
 
+// Minimal bootstrap call to trigger first 7702 delegation.
+// Uses a no-op style call (zero-address, zero value, empty data).
+const { id } = await client.sendCalls({
+  calls: [
+    {
+      to: "0x0000000000000000000000000000000000000000",
+      value: 0n,
+      data: "0x",
+    },
+  ],
+});
+
+console.log("delegate call id:", id);
+const status = await client.waitForCallsStatus({ id });
+console.log("delegate status:", status);
 
 export const botClient = createSmartWalletClient({
   transport: alchemyWalletTransport({
