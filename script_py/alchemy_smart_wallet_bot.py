@@ -82,6 +82,24 @@ def encode_set_uint256(value: int) -> str:
     return "0x" + (selector + encoded_args).hex()
 
 
+def _sign_raw_hash(raw_payload: str, private_key: str) -> Any:
+    raw = raw_payload[2:] if raw_payload.startswith("0x") else raw_payload
+    msg_hash = bytes.fromhex(raw)
+    return Account._sign_hash(message_hash=msg_hash, private_key=private_key)
+
+
+def _sign_eip7702_auth(raw_payload: str, private_key: str) -> str:
+    # Match SDK behavior: serialize as r || s || yParity (0/1).
+    signed = _sign_raw_hash(raw_payload, private_key)
+    y_parity = signed.v - 27 if signed.v >= 27 else signed.v
+    return (
+        "0x"
+        + signed.r.to_bytes(32, "big").hex()
+        + signed.s.to_bytes(32, "big").hex()
+        + y_parity.to_bytes(1, "big").hex()
+    )
+
+
 def create_session(
     rpc: AlchemyRpcClient,
     owner_account: str,
@@ -127,6 +145,9 @@ def create_session(
     # Mirror @alchemy/wallet-apis grantPermissions() context packing:
     # context = 0x00 ++ sessionId ++ ownerSignature
     context = "0x00" + session_id[2:] + session_signature[2:]
+    print("context:", context)
+    print("session_id:", session_id)
+    print("session_signature:", session_signature)
     return {
         "context": context,
         # Raw Wallet API capability shape for wallet_prepareCalls/sendPreparedCalls
@@ -142,7 +163,7 @@ def send_and_wait(
     to: str,
     value: str,
     data_hex: str,
-    permission_obj: Dict[str, Any],
+    permission_obj: Optional[Dict[str, Any]],
     chain_id: str,
     paymaster_policy_id: Optional[str],
     prepare_method_name: str = "wallet_prepareCalls",
@@ -170,6 +191,7 @@ def send_and_wait(
         method_name=status_method_name,
     )
     print("final status:", status)
+    return {"id": call_id, "status": status}
 
 
 def prepare_and_send_calls(
@@ -179,7 +201,7 @@ def prepare_and_send_calls(
     to: str,
     value: str,
     data_hex: str,
-    permission_obj: Dict[str, Any],
+    permission_obj: Optional[Dict[str, Any]],
     chain_id: str,
     paymaster_policy_id: Optional[str],
     prepare_method_name: str = "wallet_prepareCalls",
@@ -206,33 +228,63 @@ def prepare_and_send_calls(
 
     prepared = rpc.call(prepare_method_name, [prepare_body])
 
-    sig_req = prepared.get("signatureRequest", {})
-    sig_type = sig_req.get("type")
-    sig_data = sig_req.get("data")
-    if not sig_type or sig_data is None:
-        raise RuntimeError(f"wallet_prepareCalls missing signatureRequest fields: {prepared}")
+    prepared_type = prepared.get("type")
+    if prepared_type == "array":
+        signed_items: List[Dict[str, Any]] = []
+        for item in prepared.get("data", []):
+            sig_req = item.get("signatureRequest", {})
+            sig_type = sig_req.get("type")
+            if sig_type == "eip7702Auth":
+                raw_payload = sig_req.get("rawPayload")
+                if not raw_payload:
+                    raise RuntimeError(f"eip7702Auth missing rawPayload: {sig_req}")
+                signature = _sign_eip7702_auth(raw_payload, delegate_private_key)
+            elif sig_type == "personal_sign":
+                raw = (sig_req.get("data") or {}).get("raw")
+                if not raw:
+                    raise RuntimeError(f"personal_sign missing data.raw: {sig_req}")
+                signed = Account.sign_message(
+                    encode_defunct(hexstr=raw),
+                    private_key=delegate_private_key,
+                )
+                signature = "0x" + signed.signature.hex()
+            else:
+                raise RuntimeError(f"Unsupported signatureRequest.type for array item: {sig_type}")
 
-    if sig_type == "personal_sign":
-        # Align with wallet API: sign signatureRequest.data (typically {"raw": "0x..."}).
-        raw = sig_data.get("raw") if isinstance(sig_data, dict) else None
+            signed_item = {
+                k: v
+                for k, v in item.items()
+                if k not in ("signatureRequest", "feePayment")
+            }
+            signed_item["signature"] = {"type": "secp256k1", "data": signature}
+            signed_items.append(signed_item)
+
+        send_prepared_body = {"type": "array", "data": signed_items}
+        if capabilities:
+            send_prepared_body["capabilities"] = capabilities
+    else:
+        sig_req = prepared.get("signatureRequest", {})
+        sig_type = sig_req.get("type")
+        if sig_type != "personal_sign":
+            raise RuntimeError(f"Unsupported signatureRequest.type for prepared calls: {sig_type}")
+        raw = (sig_req.get("data") or {}).get("raw")
         if not raw:
             raise RuntimeError(f"personal_sign missing data.raw: {sig_req}")
         signed = Account.sign_message(
             encode_defunct(hexstr=raw),
             private_key=delegate_private_key,
         )
-    else:
-        raise RuntimeError(f"Unsupported signatureRequest.type for prepared calls: {sig_type}")
+        userop_signature = "0x" + signed.signature.hex()
 
-    userop_signature = "0x" + signed.signature.hex()
+        send_prepared_body = {
+            "type": prepared_type,
+            "data": prepared.get("data"),
+            "chainId": prepared.get("chainId", chain_id),
+            "signature": {"type": "secp256k1", "data": userop_signature},
+        }
+        if capabilities:
+            send_prepared_body["capabilities"] = capabilities
 
-    send_prepared_body: Dict[str, Any] = {
-        "type": prepared.get("type"),
-        "data": prepared.get("data"),
-        "chainId": prepared.get("chainId", chain_id),
-        "capabilities": capabilities,
-        "signature": {"type": "secp256k1", "data": userop_signature},
-    }
     result = rpc.call(send_prepared_method_name, [send_prepared_body])
     call_id = result.get("id")
     if not call_id:
@@ -283,7 +335,7 @@ def main() -> None:
     prepare_method = os.getenv("ALCHEMY_PREPARE_METHOD", "wallet_prepareCalls")
     send_method = os.getenv("ALCHEMY_SEND_METHOD", "wallet_sendPreparedCalls")
     status_method = os.getenv("ALCHEMY_STATUS_METHOD", "wallet_getCallsStatus")
-    chain_id = os.getenv("CHAIN_ID", "0xaa36a7")
+    chain_id = os.getenv("CHAIN_ID", "0x14a34")
 
     missing = [
         name
